@@ -1,0 +1,73 @@
+name: DevSecOps Tools & Security Scan on Debian 13 (Trixie)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+  workflow_dispatch:  # Manual trigger
+
+permissions:
+  contents: read
+  security-events: write  # For SARIF uploads
+
+jobs:
+  install-and-scan:
+    runs-on: ubuntu-latest  # Host runner; Debian 13 runs inside container
+    container:
+      image: debian:13  # Debian 13 (Trixie) base image
+      options: --user root  # Run as root for sudo-free installs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for gitleaks
+
+      - name: Update Debian 13 packages
+        run: |
+          apt-get update
+          apt-get install -y curl jq unzip tar git python3-pip
+          pip3 install pipx  # For Checkov fallback if needed
+          apt-get clean  # Keep image lean
+
+      - name: Cache DevSecOps tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin
+          key: devsecops-tools-debian13-${{ runner.os }}-${{ hashFiles('scripts/devsecops-tools.sh') }}
+          restore-keys: |
+            devsecops-tools-debian13-${{ runner.os }}-
+
+      - name: Install DevSecOps Tools
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Secure, built-in token
+          PREFIX: ~/.local/bin  # Consistent with your script
+        run: |
+          chmod +x scripts/devsecops-tools.sh
+          ./scripts/devsecops-tools.sh -v  # Verbose for logs
+          echo "$HOME/.local/bin" >> $GITHUB_PATH  # Add to PATH
+
+      - name: Run Trivy filesystem scan
+        if: always()
+        run: trivy fs --exit-code 1 --format sarif --output trivy-results.sarif .
+
+      - name: Run Checkov IaC scan
+        if: always()
+        run: checkov -d . --compact --quiet --output sarif --output-file-path checkov-results.sarif
+
+      - name: Run Gitleaks secrets detection
+        if: always()
+        run: gitleaks detect --source . --report-format sarif --report-path gitleaks-results.sarif --verbose
+
+      - name: Run Trufflehog secrets scan
+        if: always()
+        run: trufflehog filesystem . --format sarif --output trufflehog-results.sarif
+
+      - name: Upload SARIF results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: |
+            trivy-results.sarif
+            checkov-results.sarif
+            gitleaks-results.sarif
+            trufflehog-results.sarif
